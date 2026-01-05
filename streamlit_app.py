@@ -14,6 +14,8 @@ import numpy as np
 from datetime import datetime, timedelta
 import pymysql
 import plotly.graph_objects as go
+import plotly.express as px
+import yfinance as yf
 import os
 
 # =============================================================================
@@ -138,6 +140,117 @@ def load_rebalancing_history():
 
 
 # =============================================================================
+# Live API Functions (for time-series charts)
+# =============================================================================
+@st.cache_data(ttl=3600)
+def load_vix_history(days=180):
+    """VIX 시계열 (Yahoo Finance 직접 호출)"""
+    try:
+        from datetime import datetime, timedelta
+        start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        vix = yf.download('^VIX', start=start, progress=False)
+        if vix.empty:
+            return pd.DataFrame()
+        if isinstance(vix.columns, pd.MultiIndex):
+            vix = vix['Close'].iloc[:, 0] if 'Close' in vix.columns.get_level_values(0) else vix.iloc[:, 0]
+        elif 'Close' in vix.columns:
+            vix = vix['Close']
+        else:
+            vix = vix.iloc[:, 0]
+        return vix.to_frame(name='VIX')
+    except:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def load_dxy_history(days=180):
+    """DXY 시계열 (Yahoo Finance 직접 호출)"""
+    try:
+        from datetime import datetime, timedelta
+        start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        dxy = yf.download('DX-Y.NYB', start=start, progress=False)
+        if dxy.empty:
+            return pd.DataFrame()
+        if isinstance(dxy.columns, pd.MultiIndex):
+            dxy = dxy['Close'].iloc[:, 0] if 'Close' in dxy.columns.get_level_values(0) else dxy.iloc[:, 0]
+        elif 'Close' in dxy.columns:
+            dxy = dxy['Close']
+        else:
+            dxy = dxy.iloc[:, 0]
+        return dxy.to_frame(name='DXY')
+    except:
+        return pd.DataFrame()
+
+
+def create_indicator_gauge(value, title, min_val, max_val, thresholds=None, reverse_colors=False):
+    """게이지 차트 생성"""
+    if value is None or pd.isna(value):
+        value = (min_val + max_val) / 2
+    value = max(min_val, min(max_val, float(value)))
+    
+    if thresholds is None:
+        low = min_val + (max_val - min_val) * 0.33
+        high = min_val + (max_val - min_val) * 0.66
+    else:
+        low = thresholds.get('low', 25)
+        high = thresholds.get('high', 75)
+    
+    if reverse_colors:
+        steps = [
+            {'range': [min_val, low], 'color': "#f8d7da"},
+            {'range': [low, high], 'color': "#fff3cd"},
+            {'range': [high, max_val], 'color': "#d4edda"}
+        ]
+    else:
+        steps = [
+            {'range': [min_val, low], 'color': "#d4edda"},
+            {'range': [low, high], 'color': "#fff3cd"},
+            {'range': [high, max_val], 'color': "#f8d7da"}
+        ]
+    
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=value,
+        title={'text': title, 'font': {'size': 16}},
+        gauge={
+            'axis': {'range': [min_val, max_val], 'tickwidth': 1},
+            'bar': {'color': "darkblue"},
+            'steps': steps,
+            'threshold': {
+                'line': {'color': "red", 'width': 2},
+                'thickness': 0.75,
+                'value': value
+            }
+        }
+    ))
+    fig.update_layout(height=250, margin=dict(t=50, b=30, l=30, r=30))
+    return fig
+
+
+def create_sector_heatmap(sector_df):
+    """섹터 히트맵 생성"""
+    if sector_df.empty:
+        return go.Figure()
+    
+    sectors = sector_df['sector'].tolist()
+    returns_1d = sector_df['return_1d'].tolist()
+    
+    fig = go.Figure(data=go.Heatmap(
+        z=[returns_1d],
+        x=sectors,
+        y=['1D Return'],
+        colorscale='RdYlGn',
+        zmid=0,
+        text=[[f"{r:.2%}" if pd.notna(r) else "-" for r in returns_1d]],
+        texttemplate="%{text}",
+        textfont={"size": 12},
+        hovertemplate='%{x}: %{z:.2%}<extra></extra>'
+    ))
+    fig.update_layout(height=120, margin=dict(t=20, b=20, l=20, r=20))
+    return fig
+
+
+# =============================================================================
 # Page Config
 # =============================================================================
 st.set_page_config(
@@ -216,6 +329,10 @@ with idx_tab2:
             display_df[col] = display_df[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "-")
         
         st.dataframe(display_df, use_container_width=True, hide_index=True)
+        
+        # 히트맵 추가
+        fig_heatmap = create_sector_heatmap(sector_df)
+        st.plotly_chart(fig_heatmap, use_container_width=True)
     else:
         st.info("섹터 데이터 없음")
 
@@ -390,3 +507,70 @@ if not indicators_df.empty:
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Powered by MariaDB on Synology NAS")
+
+# =============================================================================
+# 시장 심리 (하단)
+# =============================================================================
+st.markdown("---")
+st.subheader("💭 시장 심리")
+
+fg_col1, fg_col2, fg_col3 = st.columns([1, 2, 1])
+with fg_col2:
+    if not indicators_df.empty and pd.notna(indicators_df.iloc[0]['fear_greed']):
+        fg_val = indicators_df.iloc[0]['fear_greed']
+        fg_text = indicators_df.iloc[0]['fear_greed_text']
+        fig_fg = create_indicator_gauge(
+            fg_val, "CNN Fear & Greed Index", 0, 100,
+            thresholds={'low': 25, 'high': 75},
+            reverse_colors=True
+        )
+        st.plotly_chart(fig_fg, use_container_width=True, config={'displayModeBar': False})
+        if fg_text:
+            st.markdown(f"<center><b>{fg_text}</b></center>", unsafe_allow_html=True)
+    else:
+        st.info("Fear & Greed 데이터 없음")
+
+# VIX 시계열 차트
+with st.expander("📈 VIX / DXY 시계열"):
+    vix_col, dxy_col = st.columns(2)
+    
+    with vix_col:
+        vix_hist = load_vix_history(180)
+        if not vix_hist.empty:
+            fig_vix = go.Figure()
+            fig_vix.add_trace(go.Scatter(
+                x=vix_hist.index, y=vix_hist['VIX'],
+                name='VIX', line=dict(color='#d62728', width=2)
+            ))
+            fig_vix.update_layout(title='VIX (180D)', height=250, margin=dict(t=40, b=30))
+            st.plotly_chart(fig_vix, use_container_width=True)
+        else:
+            st.info("VIX 데이터 로딩 실패")
+    
+    with dxy_col:
+        dxy_hist = load_dxy_history(180)
+        if not dxy_hist.empty:
+            fig_dxy = go.Figure()
+            fig_dxy.add_trace(go.Scatter(
+                x=dxy_hist.index, y=dxy_hist['DXY'],
+                name='DXY', line=dict(color='#1f77b4', width=2)
+            ))
+            fig_dxy.update_layout(title='DXY (180D)', height=250, margin=dict(t=40, b=30))
+            st.plotly_chart(fig_dxy, use_container_width=True)
+        else:
+            st.info("DXY 데이터 로딩 실패")
+
+# =============================================================================
+# Footer
+# =============================================================================
+st.markdown("---")
+st.markdown(
+    f"""
+    <div style="text-align: center; color: gray; font-size: 0.8rem;">
+        📊 Market Regime Dashboard | 
+        Data Source: MariaDB, Yahoo Finance | 
+        Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+    </div>
+    """,
+    unsafe_allow_html=True
+)

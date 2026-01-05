@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Environment
+.env
+*.pem
+*.key
+
+# Cache & Data
+*.csv
+*.parquet
+*.pkl
+*.h5
+cache/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ============================================
+# 핵심 로직 (Git에서 제외!)
+# ============================================
+MarketRegimeMonitoring/
+data_pipeline/
+utils/
+GD_utils_refer/

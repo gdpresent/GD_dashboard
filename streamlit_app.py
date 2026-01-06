@@ -17,6 +17,30 @@ import plotly.graph_objects as go
 import plotly.express as px
 import yfinance as yf
 import os
+from pathlib import Path
+
+# .env 파일 로드 (로컬 실행 시)
+try:
+    env_path = Path(__file__).parent / 'data_pipeline' / '.env'
+    if env_path.exists():
+        # UTF-16 인코딩 처리 (Windows 메모장 기본 저장 형식)
+        try:
+            with open(env_path, 'r', encoding='utf-16') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        os.environ.setdefault(key.strip(), value.strip())
+        except UnicodeDecodeError:
+            # UTF-8 fallback
+            with open(env_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        os.environ.setdefault(key.strip(), value.strip())
+except Exception:
+    pass  # Streamlit Cloud에서는 secrets 사용
 
 # =============================================================================
 # Constants
@@ -46,7 +70,7 @@ def get_db_connection():
     return pymysql.connect(
         host=os.getenv('MARIADB_HOST', 'gdpresent.synology.me'),
         port=int(os.getenv('MARIADB_PORT', 3306)),
-        user=os.getenv('MARIADB_USER', 'regime_user'),
+        user=os.getenv('MARIADB_USER', 'root'),
         password=os.getenv('MARIADB_PASSWORD', ''),
         database=os.getenv('MARIADB_DATABASE', 'regime_db'),
         charset='utf8mb4'
@@ -54,10 +78,14 @@ def get_db_connection():
 
 def query_df(sql: str) -> pd.DataFrame:
     """SQL 실행 후 DataFrame 반환"""
-    conn = get_db_connection()
-    df = pd.read_sql(sql, conn)
-    conn.close()
-    return df
+    try:
+        conn = get_db_connection()
+        df = pd.read_sql(sql, conn)
+        conn.close()
+        return df
+    except Exception as e:
+        # 테이블이 없거나 연결 실패 시 빈 DataFrame 반환
+        return pd.DataFrame()
 
 # =============================================================================
 # Data Loading Functions
@@ -278,18 +306,43 @@ def plot_business_clock(df, title, compare=False):
     fig.add_vline(x=0, line_color="gray", line_width=1, line_dash="dot")
     
     if 'cli_level' in df.columns and 'cli_momentum' in df.columns:
-        d = df.dropna(subset=['cli_level', 'cli_momentum'])
+        d = df.dropna(subset=['cli_level', 'cli_momentum']).copy()
         x, y = d['cli_level'].values, d['cli_momentum'].values
         
-        # Compare 모드
+        # Hover 텍스트 (년월 표시)
+        hover_texts = []
+        if 'data_month' in d.columns:
+            for idx, row in d.iterrows():
+                dm = row.get('data_month')
+                if pd.notna(dm):
+                    hover_texts.append(f"{pd.to_datetime(dm).strftime('%Y-%m')}")
+                else:
+                    hover_texts.append("")
+        else:
+            hover_texts = ["" for _ in range(len(d))]
+        
+        # Compare 모드: First→Current 빨간 화살표
         if compare and 'level_first' in d.columns and 'momentum_first' in d.columns:
             valid_first = d.dropna(subset=['level_first', 'momentum_first'])
             if not valid_first.empty:
+                # First 포인트 표시
                 fig.add_trace(go.Scatter(
                     x=valid_first['level_first'], y=valid_first['momentum_first'],
                     mode='markers', marker=dict(size=5, color='gray', opacity=0.5),
-                    name='First Value'
+                    name='First Value', hoverinfo='skip'
                 ))
+                # First → Current 빨간 화살표
+                for i, row in valid_first.iterrows():
+                    dist = np.sqrt((row['cli_level'] - row['level_first'])**2 + 
+                                   (row['cli_momentum'] - row['momentum_first'])**2)
+                    if dist > 0.1:  # 충분히 움직인 경우만
+                        fig.add_annotation(
+                            x=row['cli_level'], y=row['cli_momentum'],
+                            ax=row['level_first'], ay=row['momentum_first'],
+                            xref='x', yref='y', axref='x', ayref='y',
+                            arrowhead=3, arrowsize=0.8, arrowwidth=1.5,
+                            arrowcolor='rgba(220, 20, 60, 0.6)'  # 빨간색 화살표
+                        )
         
         # 경로 라인
         if len(x) > 1:
@@ -302,19 +355,24 @@ def plot_business_clock(df, title, compare=False):
                     showlegend=False, hoverinfo='skip'
                 ))
         
-        # 경로 포인트
+        # 경로 포인트 (hover에 년월 표시)
         fig.add_trace(go.Scatter(
             x=x, y=y, mode='markers',
             marker=dict(size=10, color='white', line=dict(color='navy', width=2)),
-            name='Path'
+            name='Path',
+            text=hover_texts,
+            hovertemplate='%{text}<br>Level: %{x:.2f}<br>Momentum: %{y:.2f}<extra></extra>'
         ))
         
         # 최신 포인트
         if len(x) > 0:
+            latest_hover = hover_texts[-1] if hover_texts else ""
             fig.add_trace(go.Scatter(
                 x=[x[-1]], y=[y[-1]], mode='markers',
                 marker=dict(size=14, color='red', line=dict(color='white', width=2)),
-                name='Latest'
+                name='Latest',
+                text=[latest_hover],
+                hovertemplate='%{text}<br>Level: %{x:.2f}<br>Momentum: %{y:.2f}<extra></extra>'
             ))
     
     # 라벨
@@ -364,26 +422,36 @@ def plot_regime_strip(df):
                       yaxis=dict(categoryorder='array', categoryarray=['SMART', 'FRESH', 'FIRST']))
     return fig
 
-def plot_country_cumulative_returns(df, country_name):
-    """국가별 누적 수익률 차트"""
+def plot_country_daily_returns(df, country_name):
+    """국가별 일간 수익률 차트 (누적수익률에서 역계산)"""
     if df is None or df.empty:
         fig = go.Figure()
         fig.update_layout(title=f"[{country_name}] 데이터 없음")
         return fig
     
     fig = go.Figure()
-    if 'benchmark_return' in df.columns:
-        fig.add_trace(go.Scatter(x=df['trade_date'], y=df['benchmark_return'], name='Benchmark', line=dict(color='silver', dash='dash')))
-    if 'first_return' in df.columns:
-        fig.add_trace(go.Scatter(x=df['trade_date'], y=df['first_return'], name='First', line=dict(color='#1f77b4', width=2)))
-    if 'fresh_return' in df.columns:
-        fig.add_trace(go.Scatter(x=df['trade_date'], y=df['fresh_return'], name='Fresh', line=dict(color='#2ca02c', width=2)))
-    if 'smart_return' in df.columns:
-        fig.add_trace(go.Scatter(x=df['trade_date'], y=df['smart_return'], name='Smart', line=dict(color='#d62728', width=2)))
     
-    fig.update_layout(title=f"[{country_name}] 누적 수익률", height=350,
+    # 누적수익률을 일간수익률로 변환
+    if 'benchmark_return' in df.columns:
+        daily_bench = df['benchmark_return'].pct_change().fillna(0)
+        fig.add_trace(go.Scatter(x=df['trade_date'], y=daily_bench, name='Benchmark', 
+                                  line=dict(color='silver', dash='dash', width=1)))
+    if 'first_return' in df.columns:
+        daily_first = df['first_return'].pct_change().fillna(0)
+        fig.add_trace(go.Scatter(x=df['trade_date'], y=daily_first, name='First', 
+                                  line=dict(color='#1f77b4', width=1.5)))
+    if 'fresh_return' in df.columns:
+        daily_fresh = df['fresh_return'].pct_change().fillna(0)
+        fig.add_trace(go.Scatter(x=df['trade_date'], y=daily_fresh, name='Fresh', 
+                                  line=dict(color='#2ca02c', width=1.5)))
+    if 'smart_return' in df.columns:
+        daily_smart = df['smart_return'].pct_change().fillna(0)
+        fig.add_trace(go.Scatter(x=df['trade_date'], y=daily_smart, name='Smart', 
+                                  line=dict(color='#d62728', width=1.5)))
+    
+    fig.update_layout(title=f"[{country_name}] 일간 수익률", height=350,
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                      yaxis_tickformat='.0%', hovermode='x unified')
+                      yaxis_tickformat='.1%', hovermode='x unified')
     return fig
 
 # =============================================================================
@@ -403,6 +471,29 @@ st.markdown("""
 # Sidebar
 # =============================================================================
 st.sidebar.title("⚙️ Settings")
+
+# 날짜 선택 (과거 데이터 조회)
+@st.cache_data(ttl=3600)
+def get_available_dates():
+    """DB에 저장된 날짜 목록 조회"""
+    sql = "SELECT DISTINCT date FROM regime_summary ORDER BY date DESC LIMIT 30"
+    df = query_df(sql)
+    if not df.empty:
+        return df['date'].tolist()
+    return []
+
+available_dates = get_available_dates()
+if available_dates:
+    date_options = ["최신 데이터"] + [str(d) for d in available_dates]
+    selected_date_str = st.sidebar.selectbox("📅 데이터 기준일", date_options, index=0,
+                                              help="과거 저장된 데이터로 조회")
+    if selected_date_str == "최신 데이터":
+        selected_data_date = None  # None이면 MAX(date) 사용
+    else:
+        selected_data_date = selected_date_str
+else:
+    selected_data_date = None
+
 if st.sidebar.button("🔄 데이터 새로고침"):
     st.cache_data.clear()
     st.rerun()
@@ -562,31 +653,43 @@ if countries_in_db:
                 st.info(f"{country}: 상세 데이터 없음 (data_exporter 실행 필요)")
                 continue
             
-            # 누적 수익률 차트
+            # 일간 수익률 차트
             if not country_returns.empty:
-                st.markdown("#### 📊 누적 수익률")
-                fig_returns = plot_country_cumulative_returns(country_returns, info['name'])
+                st.markdown("#### 📊 일간 수익률")
+                fig_returns = plot_country_daily_returns(country_returns, info['name'])
                 st.plotly_chart(fig_returns, use_container_width=True)
             
-            # 국면 스트립 차트
+            # 국면 스트립 차트 (전체 기간 - 누적수익률과 동일)
             if not country_regimes.empty:
                 st.markdown("#### 📅 국면 타임라인")
-                fig_strip = plot_regime_strip(country_regimes)
+                fig_strip = plot_regime_strip(country_regimes)  # 전체 데이터 사용
                 st.plotly_chart(fig_strip, use_container_width=True)
             
-            # Business Cycle Clock
+            # Business Cycle Clock (3개: First, PIT History, Current)
             if not country_regimes.empty:
-                st.markdown("#### 🕐 Business Cycle Clock")
-                col1, col2 = st.columns(2)
+                st.markdown("#### 🕐 Business Cycle Clock (최근 24개월)")
+                col1, col2, col3 = st.columns(3)
+                
+                recent_24m = country_regimes.tail(24)
                 
                 with col1:
-                    fig_clock = plot_business_clock(country_regimes.tail(24), "PIT History", compare=True)
-                    st.plotly_chart(fig_clock, use_container_width=True)
+                    # First Clock: level_first, momentum_first 값 사용
+                    first_df = recent_24m.copy()
+                    if 'level_first' in first_df.columns and 'momentum_first' in first_df.columns:
+                        first_df['cli_level'] = first_df['level_first']
+                        first_df['cli_momentum'] = first_df['momentum_first']
+                    fig_first = plot_business_clock(first_df, "First", compare=False)
+                    st.plotly_chart(fig_first, use_container_width=True)
                 
                 with col2:
-                    # 최근 3개월만 표시
-                    fig_clock_recent = plot_business_clock(country_regimes.tail(6), "Recent (6mo)", compare=False)
-                    st.plotly_chart(fig_clock_recent, use_container_width=True)
+                    # PIT History Clock: 현재 값 기준, First와 비교 화살표
+                    fig_pit = plot_business_clock(recent_24m, "PIT History", compare=True)
+                    st.plotly_chart(fig_pit, use_container_width=True)
+                
+                with col3:
+                    # Current: 24개월 전체, First와 비교 화살표 포함
+                    fig_current = plot_business_clock(recent_24m, "Current", compare=True)
+                    st.plotly_chart(fig_current, use_container_width=True)
 
 st.markdown("---")
 
